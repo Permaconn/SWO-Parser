@@ -1,10 +1,27 @@
+#!/bin/python3
 #
 #  This program is free software. It comes without any 
 #  warranty, to the extent permitted by applicable law.
 #
 
 import socket
+import select
 import time
+import re
+
+class ansicolor:
+    RESET   = b'\033[0m'
+    BLACK   = b'\033[30m'
+    RED     = b'\033[31m'
+    GREEN   = b'\033[32m'
+    YELLOW  = b'\033[33m'
+    BLUE    = b'\033[34m'
+    MAGENTA = b'\033[35m'
+    CYAN    = b'\033[36m'
+    WHITE   = b'\033[37m'
+    GREY    = b'\033[90m'
+    YELLOW2 = b'\033[93m'
+    WHITE2  = b'\033[97m'
 
 class Stream:
     """
@@ -60,10 +77,29 @@ class Stream:
             
     def _output(self, s):
         print(s)
+        sansi = b''; eansi = b''
+        if "TEST >" in s:
+            sansi  = ansicolor.YELLOW
+        if "INFO >" in s:
+            sansi  = ansicolor.WHITE2
+        if "ERROR>" in s:
+            sansi  = ansicolor.RED
+        if "WARN >" in s:
+            sansi  = ansicolor.GREEN
+        if "DEBUG>" in s:
+            sansi  = ansicolor.WHITE
+        if "TRACE>" in s:
+            sansi  = ansicolor.GREY
+        if len(sansi) > 0:
+            eansi = ansicolor.RESET
+        line = sansi + s.encode() + eansi
+
         if self.tcl_socket is not None:
-            self.tcl_socket.sendall(b'puts "' + s.encode('utf-8') + b'"\r\n\x1a')
-        
-        
+            self.tcl_socket.sendall(b'puts "' + re.escape(line) + b'"\x1a')
+
+        print(line.decode('ascii', 'ignore'))
+
+
 class StreamManager:
     """
     Manages up to 32 byte streams.
@@ -125,55 +161,89 @@ class StreamManager:
                 return
                 
             if stream_id in self.streams:
-                s = bstring[1:payload_size+1].decode('ascii')
+                s = bstring[1:payload_size+1].decode('ascii','ignore')
                 self.streams[stream_id].add_chars(s)
             
             bstring = bstring[payload_size+1:]
-   
+
 
 #### Main program ####
 
 # Set up the socket to the OpenOCD Tcl server
 HOST = 'localhost'
 PORT = 6666
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcl_socket:
-    tcl_socket.connect((HOST, PORT))
-    tcl_socket.settimeout(0)
-    
-    # Create a stream manager and add three streams
-    streams = StreamManager()
-    streams.add_stream(Stream(0, '', tcl_socket))
-    streams.add_stream(Stream(1, 'WARNING: '))
-    streams.add_stream(Stream(2, 'ERROR: ', tcl_socket))
-    
-    # Enable the tcl_trace output
-    tcl_socket.sendall(b'tcl_trace on\n\x1a')
 
-    
-    tcl_buf = b''
-    while True:
-        # Wait for new data from the socket
-        data = b''
-        while len(data) == 0:
+done = False
+while not done:
+
+    count = 0
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcl_socket:
+        try:
+            tcl_socket.connect((HOST, PORT))
+
+            tcl_socket.setblocking(0)
+            tcl_socket.settimeout(0)
+
+            # Create a stream manager and add three streams
+            streams = StreamManager()
+            streams.add_stream(Stream(0, '', tcl_socket))
+            streams.add_stream(Stream(1, 'WARNING: '))
+            streams.add_stream(Stream(2, 'ERROR: ', tcl_socket))
+
+            # Enable the tcl_trace output
+            tcl_socket.sendall(b'tcl_trace on\n\x1a')
+
+        except:
+            print(".", end='', flush=True)
+            time.sleep(1)
+            continue;
+
+        print("\n<<Connected>>")
+
+        tcl_buf = b''
+        while True:
+            # Wait for new data from the socket
+
             try:
-                data = tcl_socket.recv(1024)
-            except BlockingIOError:
-                time.sleep(0.1)
+                readable, writable, exceptional = select.select([tcl_socket,], [], [tcl_socket,], 5)
 
-        tcl_buf = tcl_buf + data
+                data = b''
+                if len(readable) > 0:
+                    data = tcl_socket.recv(1024)
+                    if not data:
+                        break
+                    tcl_buf = tcl_buf + data
 
-        # Tcl messages are terminated with a 0x1A byte
-        temp = tcl_buf.split(b'\x1a',1)
-        while len(temp) == 2:
-            # Parse the Tcl message
-            streams.parse_tcl(temp[0])
-            
-            # Remove that message from tcl_buf and grab another message from
-            # the buffer if the is one
-            tcl_buf = temp[1]
+            except KeyboardInterrupt:
+                done=True
+                break
+            except Exception as err:
+                print('<<Disconnected>>')
+                try:
+                    tcl_socket.shutdown(2)    # 0 = done receiving, 1 = done sending, 2 = both
+                    tcl_socket.close()        # connection error event here, maybe reconnect
+                except:
+                    pass
+                break
+
+
+            # Tcl messages are terminated with a 0x1A byte
             temp = tcl_buf.split(b'\x1a',1)
-    
-    
-    # Turn off the trace data before closing the port
-    # XXX: There currently isn't a way for the code to actually reach this line
-    tcl_socket.sendall(b'tcl_trace off\n\x1a')
+            while len(temp) == 2:
+                # Parse the Tcl message
+                streams.parse_tcl(temp[0])
+
+                # Remove that message from tcl_buf and grab another message from
+                # the buffer if the is one
+                tcl_buf = temp[1]
+                temp = tcl_buf.split(b'\x1a',1)
+
+        # Turn off the trace data before closing the port
+        # XXX: There currently isn't a way for the code to actually reach this line
+        try:
+            tcl_socket.sendall(b'tcl_trace off\n\x1a')
+        except:
+            pass
+
+print("<<Done>>")
